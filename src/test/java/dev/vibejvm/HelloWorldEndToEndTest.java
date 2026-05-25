@@ -28,13 +28,16 @@ class HelloWorldEndToEndTest {
     }
 
     @Test
-    void exactlyFourInstructionsRunInMain() {
+    void mainIsCompiledOnceAndPrintlnDispatchesOnce() {
         Vm vm = newVm();
-        // Bootstrap and resolve HelloWorld so we can locate main BEFORE execution.
+        // Bootstrap and resolve the two methods we assert on BEFORE execution.
         vm.bootstrap();
         VmClass hello = vm.classRegistry().resolve("HelloWorld");
         VmMethod main = hello.findMethod(MethodKey.of("main", "([Ljava/lang/String;)V"));
+        VmMethod println = vm.printStreamClass()
+                .findMethod(MethodKey.of("println", "(Ljava/lang/String;)V"));
         assertNotNull(main);
+        assertNotNull(println);
 
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         PrintStream originalOut = System.out;
@@ -44,8 +47,17 @@ class HelloWorldEndToEndTest {
         } finally {
             System.setOut(originalOut);
         }
-        assertEquals(4, vm.executedInstructionCount(main),
-                "main must execute exactly 4 bytecode instructions; >4 means native dispatch broke");
+
+        // The JIT pipeline must fire exactly once each way: main is compiled a single time, and
+        // the println native handler is dispatched a single time. >1 compile means the cache broke;
+        // a native count != 1 means dispatch entered (or skipped) real PrintStream bytecode.
+        assertEquals(1, vm.compileCount(main), "main must be JIT-compiled exactly once");
+        assertEquals(1, vm.nativeInvocationCount(println),
+                "println native handler must fire exactly once");
+        // Bonus, in the spirit of the old anti-cheat count: the JIT really lowered main's 4 bytecodes
+        // (getstatic, ldc, invokevirtual, return) rather than short-circuiting.
+        assertEquals(4, vm.compiledInstructionCount(main),
+                "main compiles to exactly 4 guest bytecode instructions");
     }
 
     private static Vm newVm() {

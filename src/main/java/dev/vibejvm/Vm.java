@@ -4,8 +4,7 @@ import dev.vibejvm.classfile.AppClassPath;
 import dev.vibejvm.classfile.BootstrapClassLoader;
 import dev.vibejvm.classfile.ClassRegistry;
 import dev.vibejvm.error.LinkageException;
-import dev.vibejvm.interp.Frame;
-import dev.vibejvm.interp.Interpreter;
+import dev.vibejvm.jit.Jit;
 import dev.vibejvm.model.MethodKey;
 import dev.vibejvm.model.VmArray;
 import dev.vibejvm.model.VmClass;
@@ -18,16 +17,14 @@ import dev.vibejvm.nativeimpl.PrintStreamNatives;
 
 import java.nio.file.Path;
 import java.util.HashMap;
-import java.util.IdentityHashMap;
 import java.util.Map;
 
 public final class Vm {
     private final BootstrapClassLoader bootstrap;
     private final ClassRegistry classRegistry;
     private final NativeRegistry nativeRegistry;
-    private final Interpreter interpreter;
+    private final Jit jit;
     private final Map<String, VmString> stringInterns = new HashMap<>();
-    private final Map<VmMethod, Integer> executedInstructionCounts = new IdentityHashMap<>();
 
     private VmClass objectClass;
     private VmClass stringClass;
@@ -39,12 +36,12 @@ public final class Vm {
         this.bootstrap = new BootstrapClassLoader(javaHome);
         this.classRegistry = new ClassRegistry(bootstrap, new AppClassPath(appClasspath));
         this.nativeRegistry = new NativeRegistry();
-        this.interpreter = new Interpreter(this);
+        this.jit = new Jit(this);
     }
 
     public ClassRegistry classRegistry() { return classRegistry; }
     public NativeRegistry nativeRegistry() { return nativeRegistry; }
-    public Interpreter interpreter() { return interpreter; }
+    public Jit jit() { return jit; }
     public VmClass stringClass() { return stringClass; }
     public VmClass systemClass() { return systemClass; }
     public VmClass printStreamClass() { return printStreamClass; }
@@ -54,12 +51,16 @@ public final class Vm {
         return stringInterns.computeIfAbsent(value, v -> new VmString(stringClass, v));
     }
 
-    /** Test hook: how many bytecode instructions ran in a given method this session. */
-    public void recordExecutedInstructions(VmMethod method, int count) {
-        executedInstructionCounts.merge(method, count, Integer::sum);
+    /** Test hooks into the JIT pipeline: how many times a method was compiled, and how many
+     *  times a native handler fired for it. The anti-cheat test asserts on these. */
+    public int compileCount(VmMethod method) {
+        return jit.compileCount(method);
     }
-    public int executedInstructionCount(VmMethod method) {
-        return executedInstructionCounts.getOrDefault(method, 0);
+    public int nativeInvocationCount(VmMethod method) {
+        return jit.nativeInvocationCount(method);
+    }
+    public int compiledInstructionCount(VmMethod method) {
+        return jit.compiledInstructionCount(method);
     }
 
     /**
@@ -125,8 +126,6 @@ public final class Vm {
             argv.elements()[i] = internString(args[i]);
         }
 
-        Frame frame = new Frame(main);
-        frame.locals()[0] = argv;
-        interpreter.execute(frame);
+        jit.run(main, argv);
     }
 }
