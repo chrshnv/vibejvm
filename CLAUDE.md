@@ -59,6 +59,16 @@ extension to the right file:
   `compiledInstructionCount`, which delegate to counters in `Jit` — these are
   how the anti-cheat test proves the pipeline fired. Don't try to factor this out.
 
+- **Runtime helpers must never let an exception cross the upcall boundary.** `getStatic` /
+  `ldcString` / `invoke` run as FFM upcalls; an exception escaping one aborts the whole VM
+  (HotSpot can't unwind a Java exception through native frames). So each helper catches
+  `Throwable`, stashes the first error in `Jit.pendingError`, and returns a sentinel `0`;
+  the top-level downcall (`Jit.run`) calls `checkPendingError()` to re-raise it on the Java
+  side. `invokeCompiled` follows the same rule (it runs inside the `invoke` upcall). Any new
+  helper or any new work added to these must keep that catch-and-stash shape, or runtime errors
+  become VM aborts instead of catchable `UnsupportedOpcodeException` / `LinkageException` /
+  `NativeMissingException`.
+
 - **Native code only ever sees `int` handles, never object pointers.** References
   cross into emitted code as indices into `jit/HandleTable`. The off-heap frame
   buffer holds 64-bit slots (one per local / operand); helper results are stored

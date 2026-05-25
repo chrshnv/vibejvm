@@ -79,6 +79,12 @@ public final class Jit {
     private final Map<VmMethod, Integer> compileCounts = new IdentityHashMap<>();
     private final Map<VmMethod, Integer> nativeCounts = new IdentityHashMap<>();
 
+    // An exception thrown by a runtime helper cannot unwind back through the native
+    // downcall->upcall boundary — letting it escape an upcall stub aborts the whole VM. So helpers
+    // stash the first error here and return a sentinel; the top-level downcall re-raises it on the
+    // Java side. Single-threaded, so one slot suffices.
+    private Throwable pendingError;
+
     // Compile-time side tables: native code carries small int ids, helpers resolve them at runtime.
     private record FieldSite(String owner, String name) {}
     private record CallSite(Opcode op, String owner, String name, String desc) {}
@@ -125,7 +131,7 @@ public final class Jit {
 
     /** Entry point: compile {@code main}, lay {@code argv} into local 0, and run the native code. */
     public void run(VmMethod main, VmArray argv) {
-        CompiledMethod cm = compile(main);
+        CompiledMethod cm = compile(main); // top-level: an uncompilable main throws here, on the Java side
         try (Arena frameArena = Arena.ofConfined()) {
             MemorySegment frame = frameArena.allocate((long) cm.frameSlots() * 8);
             frame.setAtIndex(JAVA_LONG, 0, handles.box(argv)); // String[] args -> local 0
@@ -134,6 +140,19 @@ public final class Jit {
             throw e;
         } catch (Throwable t) {
             throw new LinkageException("JIT execution of " + main + " failed", t);
+        }
+        checkPendingError(); // re-raise anything a helper stashed while running inside an upcall
+    }
+
+    /** Re-raise (on the Java side) an error a runtime helper stashed during native execution. */
+    private void checkPendingError() {
+        Throwable t = pendingError;
+        if (t == null) return;
+        pendingError = null;
+        switch (t) {
+            case RuntimeException re -> throw re;
+            case Error er -> throw er;
+            default -> throw new LinkageException("JIT execution failed", t);
         }
     }
 
@@ -299,73 +318,95 @@ public final class Jit {
 
     @SuppressWarnings("unused") // reached only via the upcall stub bound in the constructor
     private int getStatic(int fieldId) {
-        FieldSite fs = fieldSites.get(fieldId);
-        VmClass owner = vm.classRegistry().resolve(fs.owner());
-        VmField field = owner.findStaticField(fs.name());
-        if (field == null) {
-            throw new LinkageException("static field not found: " + fs.owner() + "." + fs.name());
+        if (pendingError != null) return 0; // an earlier helper already failed; unwind quietly
+        try {
+            FieldSite fs = fieldSites.get(fieldId);
+            VmClass owner = vm.classRegistry().resolve(fs.owner());
+            VmField field = owner.findStaticField(fs.name());
+            if (field == null) {
+                throw new LinkageException("static field not found: " + fs.owner() + "." + fs.name());
+            }
+            return handles.box(field.owner().staticSlots()[field.slot()]);
+        } catch (Throwable t) {
+            pendingError = t;
+            return 0;
         }
-        return handles.box(field.owner().staticSlots()[field.slot()]);
     }
 
     @SuppressWarnings("unused")
     private int ldcString(int constId) {
-        return handles.box(vm.internString(stringConsts.get(constId)));
+        if (pendingError != null) return 0;
+        try {
+            return handles.box(vm.internString(stringConsts.get(constId)));
+        } catch (Throwable t) {
+            pendingError = t;
+            return 0;
+        }
     }
 
     @SuppressWarnings("unused")
     private int invoke(int methodId, MemorySegment frameBase, int argBaseSlot) {
-        CallSite cs = callSites.get(methodId);
-        int paramCount = DescriptorParser.parameterCount(cs.desc());
-        boolean isStatic = cs.op() == Opcode.INVOKESTATIC;
-        int consumed = paramCount + (isStatic ? 0 : 1);
+        if (pendingError != null) return 0;
+        try {
+            CallSite cs = callSites.get(methodId);
+            int paramCount = DescriptorParser.parameterCount(cs.desc());
+            boolean isStatic = cs.op() == Opcode.INVOKESTATIC;
+            int consumed = paramCount + (isStatic ? 0 : 1);
 
-        // The upcall hands us a zero-length view; widen it to reach the operand slots we read.
-        MemorySegment frame = frameBase.reinterpret((long) (argBaseSlot + consumed + 1) * 8);
-        int slot = argBaseSlot;
-        Object receiver = isStatic ? null : handles.unbox((int) frame.getAtIndex(JAVA_LONG, slot++));
-        Object[] args = new Object[paramCount];
-        for (int i = 0; i < paramCount; i++) {
-            args[i] = handles.unbox((int) frame.getAtIndex(JAVA_LONG, slot++));
-        }
+            // The upcall hands us a zero-length view; widen it to reach the operand slots we read.
+            MemorySegment frame = frameBase.reinterpret((long) (argBaseSlot + consumed + 1) * 8);
+            int slot = argBaseSlot;
+            Object receiver = isStatic ? null : handles.unbox((int) frame.getAtIndex(JAVA_LONG, slot++));
+            Object[] args = new Object[paramCount];
+            for (int i = 0; i < paramCount; i++) {
+                args[i] = handles.unbox((int) frame.getAtIndex(JAVA_LONG, slot++));
+            }
 
-        VmClass ownerClass = vm.classRegistry().resolve(cs.owner());
-        VmMethod target;
-        if (isStatic) {
-            target = ownerClass.findMethod(MethodKey.of(cs.name(), cs.desc()));
-        } else if (cs.op() == Opcode.INVOKEVIRTUAL && receiver instanceof VmObject vo) {
-            target = vo.vmClass().findMethod(MethodKey.of(cs.name(), cs.desc())); // virtual dispatch
-        } else {
-            target = ownerClass.findMethod(MethodKey.of(cs.name(), cs.desc()));
-        }
-        if (target == null) {
-            throw new LinkageException("method not found: " + cs.owner() + "." + cs.name() + cs.desc());
-        }
+            VmClass ownerClass = vm.classRegistry().resolve(cs.owner());
+            VmMethod target;
+            if (isStatic) {
+                target = ownerClass.findMethod(MethodKey.of(cs.name(), cs.desc()));
+            } else if (cs.op() == Opcode.INVOKEVIRTUAL && receiver instanceof VmObject vo) {
+                target = vo.vmClass().findMethod(MethodKey.of(cs.name(), cs.desc())); // virtual dispatch
+            } else {
+                target = ownerClass.findMethod(MethodKey.of(cs.name(), cs.desc()));
+            }
+            if (target == null) {
+                throw new LinkageException("method not found: " + cs.owner() + "." + cs.name() + cs.desc());
+            }
 
-        Object ret;
-        NativeHandler handler = target.nativeHandler();
-        if (handler != null) {
-            ret = handler.invoke(receiver, args, vm);
-            nativeCounts.merge(target, 1, Integer::sum);
-        } else {
-            ret = invokeCompiled(target, receiver, args); // compile-on-first-call, then run native
+            Object ret;
+            NativeHandler handler = target.nativeHandler();
+            if (handler != null) {
+                ret = handler.invoke(receiver, args, vm);
+                nativeCounts.merge(target, 1, Integer::sum);
+            } else {
+                ret = invokeCompiled(target, receiver, args); // compile-on-first-call, then run native
+                if (pendingError != null) return 0;           // a deeper frame failed
+            }
+            return DescriptorParser.returnsVoid(cs.desc()) ? 0 : handles.box(ret);
+        } catch (Throwable t) {
+            pendingError = t;
+            return 0;
         }
-        return DescriptorParser.returnsVoid(cs.desc()) ? 0 : handles.box(ret);
     }
 
+    /** Runs inside the {@code invoke} upcall, so it must never throw — failures go to pendingError. */
     private Object invokeCompiled(VmMethod target, Object receiver, Object[] args) {
-        CompiledMethod cm = compile(target);
-        try (Arena frameArena = Arena.ofConfined()) {
-            MemorySegment frame = frameArena.allocate((long) cm.frameSlots() * 8);
-            int slot = 0;
-            if (!target.isStatic()) frame.setAtIndex(JAVA_LONG, slot++, handles.box(receiver));
-            for (Object arg : args) frame.setAtIndex(JAVA_LONG, slot++, handles.box(arg));
-            int retHandle = (int) cm.entry().invoke(frame);
-            return DescriptorParser.returnsVoid(target.descriptor()) ? null : handles.unbox(retHandle);
-        } catch (RuntimeException e) {
-            throw e;
+        try {
+            CompiledMethod cm = compile(target);
+            try (Arena frameArena = Arena.ofConfined()) {
+                MemorySegment frame = frameArena.allocate((long) cm.frameSlots() * 8);
+                int slot = 0;
+                if (!target.isStatic()) frame.setAtIndex(JAVA_LONG, slot++, handles.box(receiver));
+                for (Object arg : args) frame.setAtIndex(JAVA_LONG, slot++, handles.box(arg));
+                int retHandle = (int) cm.entry().invoke(frame);
+                if (pendingError != null) return null; // a helper in the callee failed
+                return DescriptorParser.returnsVoid(target.descriptor()) ? null : handles.unbox(retHandle);
+            }
         } catch (Throwable t) {
-            throw new LinkageException("JIT call into " + target + " failed", t);
+            pendingError = t;
+            return null;
         }
     }
 }
