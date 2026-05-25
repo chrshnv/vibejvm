@@ -1,5 +1,7 @@
 package dev.vibejvm.jit;
 
+import dev.vibejvm.error.UnsupportedOpcodeException;
+
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -45,7 +47,13 @@ final class Aarch64Assembler {
 
     /** movz Wd, #imm16 — load a 16-bit immediate into a w-register (zero-extends into Xd). */
     void movImm16(int rd, int imm16) {
-        emit(0x52800000 | ((imm16 & 0xFFFF) << 5) | rd);
+        if (imm16 < 0 || imm16 > 0xFFFF) {
+            // A single MOVZ only carries 16 bits; silently masking would miscompile (wrong
+            // constant-pool id / arg slot). The v1 JIT refuses the method instead.
+            throw new UnsupportedOpcodeException(
+                    "immediate " + imm16 + " does not fit in a 16-bit movz (v1 JIT limit)");
+        }
+        emit(0x52800000 | (imm16 << 5) | rd);
     }
 
     /** Materialise a full 64-bit constant into Xd via movz + 3× movk (one per 16-bit lane). */
@@ -56,14 +64,23 @@ final class Aarch64Assembler {
         emit(0xF2E00000 | (int) (((v >>> 48) & 0xFFFF) << 5) | rd);   // movk xd, #v3, lsl #48
     }
 
+    /** The LDR/STR unsigned-offset imm12 field is 12 bits; offset = slot*8, so slot must fit 0..4095. */
+    private static int checkSlot(int slot) {
+        if (slot < 0 || slot > 0xFFF) {
+            throw new UnsupportedOpcodeException(
+                    "frame slot " + slot + " exceeds the 12-bit ldr/str offset (v1 JIT limit)");
+        }
+        return slot;
+    }
+
     /** str Xt, [Xn, #slot*8] — STR unsigned-offset, 64-bit; imm12 == slot (offset is slot*8). */
     void strSlot(int rt, int rn, int slot) {
-        emit(0xF9000000 | (slot << 10) | (rn << 5) | rt);
+        emit(0xF9000000 | (checkSlot(slot) << 10) | (rn << 5) | rt);
     }
 
     /** ldr Xt, [Xn, #slot*8] — LDR unsigned-offset, 64-bit. */
     void ldrSlot(int rt, int rn, int slot) {
-        emit(0xF9400000 | (slot << 10) | (rn << 5) | rt);
+        emit(0xF9400000 | (checkSlot(slot) << 10) | (rn << 5) | rt);
     }
 
     /** blr Xn — branch with link to the address in Xn (clobbers x30). */
